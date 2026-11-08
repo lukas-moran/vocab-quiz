@@ -531,6 +531,249 @@ function normalizeLookupSenses(senses) {
     }));
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7_000) {
+  const controller = new AbortController();
+  const upstreamSignal = options.signal;
+  let timedOut = false;
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const abortFromUpstream = () => controller.abort();
+
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) {
+      controller.abort();
+    } else {
+      upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
+    }
+  }
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new Error("在线查询超时，请稍后重试。");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+
+async function translateToChinese(text, signal) {
+  const googleUrl = new URL("https://translate.googleapis.com/translate_a/single");
+  googleUrl.searchParams.set("client", "gtx");
+  googleUrl.searchParams.set("sl", "en");
+  googleUrl.searchParams.set("tl", "zh-CN");
+  googleUrl.searchParams.set("dt", "t");
+  googleUrl.searchParams.set("q", text.slice(0, 350));
+
+  try {
+    const response = await fetchWithTimeout(googleUrl, { signal }, 6_000);
+    if (!response.ok) {
+      throw new Error("翻译服务暂时不可用。");
+    }
+
+    const payload = await response.json();
+    const translated = (payload?.[0] || [])
+      .map((segment) => segment?.[0])
+      .filter(Boolean)
+      .join("")
+      .trim()
+      .replace(/^[。；;,.，\s]+|[。；;,.，\s]+$/g, "");
+
+    if (translated) {
+      return translated;
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw error;
+    }
+  }
+
+  const fallbackUrl = new URL("https://api.mymemory.translated.net/get");
+  fallbackUrl.searchParams.set("q", text.slice(0, 350));
+  fallbackUrl.searchParams.set("langpair", "en|zh-CN");
+
+  const fallbackResponse = await fetchWithTimeout(fallbackUrl, { signal }, 6_000);
+  if (!fallbackResponse.ok) {
+    throw new Error("中文翻译暂时不可用。");
+  }
+
+  const fallbackPayload = await fallbackResponse.json();
+  const fallbackTranslation = fallbackPayload?.responseData?.translatedText
+    ?.trim()
+    .replace(/^[。；;,.，\s]+|[。；;,.，\s]+$/g, "");
+
+  if (!fallbackTranslation) {
+    throw new Error("没有取得中文翻译。");
+  }
+
+  return fallbackTranslation;
+}
+
+function collectPublicCandidates(payload, sourceType) {
+  const positionMap = {
+    noun: "noun",
+    verb: "verb",
+    adjective: "adjective",
+    adverb: "adverb",
+    preposition: "preposition",
+    conjunction: "conjunction",
+    pronoun: "pronoun",
+    numeral: "numeral",
+    article: "article",
+    determiner: "article",
+    interjection: "interjection",
+    exclamation: "interjection",
+  };
+  const groupedCandidates = new Map();
+  const seenDefinitions = new Set();
+  const groups = [];
+
+  if (sourceType === "entries" && Array.isArray(payload?.entries)) {
+    for (const entry of payload.entries) {
+      groups.push({
+        partOfSpeech: entry?.partOfSpeech,
+        definitions: (entry?.senses || []).map((sense) => sense?.definition),
+      });
+    }
+  }
+
+  if (sourceType === "meanings" && Array.isArray(payload)) {
+    for (const entry of payload) {
+      for (const meaning of entry?.meanings || []) {
+        groups.push({
+          partOfSpeech: meaning?.partOfSpeech,
+          definitions: (meaning?.definitions || []).map(
+            (definition) => definition?.definition,
+          ),
+        });
+      }
+    }
+  }
+
+  for (const group of groups) {
+    const partOfSpeech = positionMap[String(group.partOfSpeech).toLowerCase()];
+    if (!partOfSpeech) {
+      continue;
+    }
+
+    if (!groupedCandidates.has(partOfSpeech)) {
+      groupedCandidates.set(partOfSpeech, []);
+    }
+
+    for (const definition of group.definitions) {
+      const english = String(definition || "").trim();
+      if (english.length < 3 || seenDefinitions.has(english)) {
+        continue;
+      }
+
+      seenDefinitions.add(english);
+      groupedCandidates.get(partOfSpeech).push({ partOfSpeech, english });
+
+      if (groupedCandidates.get(partOfSpeech).length >= 2) {
+        break;
+      }
+    }
+  }
+
+  return [...groupedCandidates.values()].flat().slice(0, 6);
+}
+
+async function lookupFromPublicDictionary(term, signal) {
+  const encodedTerm = encodeURIComponent(term);
+  const sources = [
+    {
+      url: `https://freedictionaryapi.com/api/v1/entries/en/${encodedTerm}`,
+      sourceType: "entries",
+    },
+    {
+      url: `https://api.dictionaryapi.dev/api/v2/entries/en/${encodedTerm}`,
+      sourceType: "meanings",
+    },
+  ];
+
+  let fallbackError = null;
+  let candidates = [];
+
+  try {
+    candidates = await Promise.any(
+      sources.map(async (source) => {
+        const response = await fetchWithTimeout(
+          source.url,
+          {
+            signal,
+            headers: { Accept: "application/json" },
+          },
+          8_000,
+        );
+
+        if (!response.ok) {
+          throw new Error("公共词典中没有查到这个词。");
+        }
+
+        const payload = await response.json();
+        const extracted = collectPublicCandidates(payload, source.sourceType);
+
+        if (!extracted.length) {
+          throw new Error("没有查到可用的英文释义。");
+        }
+
+        return extracted;
+      }),
+    );
+  } catch (error) {
+    fallbackError =
+      error instanceof AggregateError
+        ? error.errors.find((item) => item?.message)
+        : error;
+  }
+
+  if (!candidates.length) {
+    throw fallbackError || new Error("没有查到可用的英文释义。");
+  }
+
+  const translated = await Promise.allSettled(
+    candidates.map(async (candidate) => ({
+      ...candidate,
+      chinese: await translateToChinese(candidate.english, signal),
+    })),
+  );
+  const grouped = new Map();
+
+  for (const result of translated) {
+    if (result.status !== "fulfilled" || !result.value.chinese) {
+      continue;
+    }
+
+    const { partOfSpeech, chinese } = result.value;
+    if (!grouped.has(partOfSpeech)) {
+      grouped.set(partOfSpeech, []);
+    }
+
+    if (!grouped.get(partOfSpeech).includes(chinese)) {
+      grouped.get(partOfSpeech).push(chinese);
+    }
+  }
+
+  const senses = [...grouped.entries()].map(([partOfSpeech, meanings]) => ({
+    partOfSpeech,
+    meaning: meanings.join("；").slice(0, 600),
+  }));
+
+  if (!senses.length) {
+    throw new Error("没有取得可用的中文释义。");
+  }
+
+  return {
+    senses,
+    source: "公共词典",
+  };
+}
+
 function applyLookupSenses(senses, source) {
   elements.senseRows.innerHTML = "";
   senses.forEach((sense) => addSenseRow(sense));
@@ -588,18 +831,31 @@ async function lookupCurrentWord({ force = false } = {}) {
       senses = normalizeLookupSenses(localWord.senses);
       source = "内置词库";
     } else {
-      const response = await fetch(`/api/lookup?word=${encodeURIComponent(term)}`, {
-        signal: lookupController.signal,
-        headers: { Accept: "application/json" },
-      });
-      const payload = await response.json().catch(() => ({}));
+      try {
+        const response = await fetch(`/api/lookup?word=${encodeURIComponent(term)}`, {
+          signal: lookupController.signal,
+          headers: { Accept: "application/json" },
+        });
+        const payload = await response.json().catch(() => ({}));
 
-      if (!response.ok) {
-        throw new Error(payload.error || "在线词典查询失败。");
+        if (!response.ok) {
+          throw new Error(payload.error || "本地词典代理不可用。");
+        }
+
+        senses = normalizeLookupSenses(payload.senses);
+        source = payload.source || "在线词典";
+      } catch (proxyError) {
+        if (proxyError.name === "AbortError") {
+          throw proxyError;
+        }
+
+        const publicResult = await lookupFromPublicDictionary(
+          term,
+          lookupController.signal,
+        );
+        senses = publicResult.senses;
+        source = publicResult.source;
       }
-
-      senses = normalizeLookupSenses(payload.senses);
-      source = payload.source || "在线词典";
     }
 
     const currentTerm = elements.wordInput.value.trim().replace(/\s+/g, " ");
